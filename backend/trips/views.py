@@ -21,9 +21,9 @@ _last_geocode_at = 0.0
 def _get_json(url, *, user_agent="RoadLedger/0.1 (ELD trip planning demonstration)"):
     request = Request(url, headers={"User-Agent": user_agent, "Accept": "application/json", "Accept-Language": "en"})
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=12) as response:
             return json.loads(response.read())
-    except (HTTPError, URLError, TimeoutError) as exc:
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("The free map service is temporarily unavailable. Please try again shortly.") from exc
 
 
@@ -39,17 +39,29 @@ def _geocode(query):
         wait = 1.1 - (time.monotonic() - _last_geocode_at)
         if wait > 0:
             time.sleep(wait)
-        results = _get_json("https://nominatim.openstreetmap.org/search?" + urlencode({"format": "jsonv2", "limit": 1, "q": query}))
         _last_geocode_at = time.monotonic()
+        results = _get_json("https://nominatim.openstreetmap.org/search?" + urlencode({"format": "jsonv2", "limit": 1, "q": query}))
         if not results:
             raise ValueError(f'Could not find "{query}". Try adding a city and state.')
-        place = {"lat": float(results[0]["lat"]), "lon": float(results[0]["lon"]), "name": results[0]["display_name"]}
+        try:
+            name = results[0]["display_name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError
+            place = {"lat": float(results[0]["lat"]), "lon": float(results[0]["lon"]), "name": name.strip()}
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            raise ValueError("The geocoding service returned an invalid location. Please try a more specific address.") from exc
+        if not math.isfinite(place["lat"]) or not math.isfinite(place["lon"]) or not -90 <= place["lat"] <= 90 or not -180 <= place["lon"] <= 180:
+            raise ValueError("The geocoding service returned invalid coordinates. Please try a more specific address.")
+        if len(_geocode_cache) >= 256:
+            _geocode_cache.pop(next(iter(_geocode_cache)))
         _geocode_cache[key] = place
         return place
 
 
 def _maneuver_text(step):
     maneuver = step.get("maneuver", {})
+    if not isinstance(maneuver, dict):
+        maneuver = {}
     kind = maneuver.get("type", "continue")
     modifier = maneuver.get("modifier", "")
     name = step.get("name") or "the road"
@@ -64,40 +76,112 @@ def _maneuver_text(step):
 
 
 def _route_trip(data):
-    places = [_geocode(data.get(field, "")) for field in ("current_location", "pickup_location", "dropoff_location")]
+    if not isinstance(data, dict):
+        raise ValueError("Trip details must be sent as a JSON object.")
+    location_fields = ("current_location", "pickup_location", "dropoff_location")
+    for field in location_fields:
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 180:
+            raise ValueError("Enter all three locations using no more than 180 characters each.")
+    places = [_geocode(data[field]) for field in location_fields]
     coordinates = ";".join(f'{p["lon"]},{p["lat"]}' for p in places)
     url = f"https://router.project-osrm.org/route/v1/driving/{coordinates}?overview=full&geometries=geojson&steps=true"
     result = _get_json(url)
-    if result.get("code") != "Ok" or not result.get("routes"):
+    if not isinstance(result, dict) or result.get("code") != "Ok" or not result.get("routes"):
         raise ValueError("No drivable route was found between these locations.")
-    route = result["routes"][0]
-    directions = []
-    for leg in route.get("legs", []):
-        for step in leg.get("steps", []):
-            directions.append({"text": _maneuver_text(step), "distance_miles": round(step.get("distance", 0) / 1609.344, 1)})
-    return {"places": places, "geometry": route["geometry"], "distance_miles": route["distance"] / 1609.344,
-            "route_hours": route["duration"] / 3600,
-            "pickup_miles": route.get("legs", [{}])[0].get("distance", 0) / 1609.344,
-            "directions": directions}
+    try:
+        route = result["routes"][0]
+        legs = route["legs"]
+        coordinates = route["geometry"]["coordinates"]
+        distance = float(route["distance"])
+        duration = float(route["duration"])
+        pickup_distance = float(legs[0]["distance"])
+        if len(legs) != 2 or len(coordinates) < 2 or not all(math.isfinite(value) for value in (distance, duration, pickup_distance)):
+            raise ValueError
+        directions = []
+        for leg in legs:
+            for step in leg.get("steps", []):
+                if not isinstance(step, dict):
+                    continue
+                step_distance = float(step.get("distance", 0))
+                if math.isfinite(step_distance):
+                    directions.append({"text": _maneuver_text(step), "distance_miles": round(step_distance / 1609.344, 1)})
+        if distance <= 0 or duration <= 0 or pickup_distance < 0 or pickup_distance > distance:
+            raise ValueError
+        safe_coordinates = []
+        for coordinate in coordinates:
+            if not isinstance(coordinate, (list, tuple)) or len(coordinate) < 2 or not all(math.isfinite(float(value)) for value in coordinate[:2]):
+                raise ValueError
+            lon, lat = float(coordinate[0]), float(coordinate[1])
+            if not -180 <= lon <= 180 or not -90 <= lat <= 90:
+                raise ValueError
+            safe_coordinates.append([lon, lat])
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError, AttributeError) as exc:
+        raise ValueError("The routing service returned an incomplete route. Please try again shortly.") from exc
+    return {"places": places, "geometry": {"type": "LineString", "coordinates": safe_coordinates}, "distance_miles": distance / 1609.344,
+            "route_hours": duration / 3600, "pickup_miles": pickup_distance / 1609.344, "directions": directions}
 
 
 def home(request):
     return render(request, "trips/index.html")
 
 
+def _validate_trip_inputs(data):
+    if not isinstance(data, dict):
+        raise ValueError("Trip details must be sent as a JSON object.")
+    for field in ("current_location", "pickup_location", "dropoff_location"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 180:
+            raise ValueError("Enter all three locations using no more than 180 characters each.")
+    cycle_value = data.get("cycle_used", data.get("current_cycle_used"))
+    if isinstance(cycle_value, bool):
+        raise ValueError("Enter cycle hours as a number from 0 through 70.")
+    try:
+        cycle_used = float(cycle_value)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Enter cycle hours as a number from 0 through 70.") from exc
+    if not math.isfinite(cycle_used) or not 0 <= cycle_used <= 70:
+        raise ValueError("Cycle used must be from 0 through 70 hours.")
+    time_zone_name = data.get("time_zone", "UTC")
+    if not isinstance(time_zone_name, str):
+        raise ValueError("Choose a valid home-terminal time zone.")
+    try:
+        ZoneInfo(time_zone_name)
+    except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
+        raise ValueError("Choose a valid home-terminal time zone.") from exc
+    departure_value = data.get("departure")
+    if not isinstance(departure_value, str):
+        raise ValueError("Choose a valid departure date and time.")
+    try:
+        datetime.fromisoformat(departure_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Choose a valid departure date and time.") from exc
+
+
 def _make_plan(data):
     miles = float(data["distance_miles"])
     if not math.isfinite(miles) or miles <= 0 or miles > 20000:
-        raise ValueError("Route distance must be between 1 and 20,000 miles.")
-    cycle_used = float(data["cycle_used"])
-    if not math.isfinite(cycle_used) or not 0 <= cycle_used < 70:
-        raise ValueError("Cycle used must be from 0 up to (but not including) 70 hours.")
+        raise ValueError("Route distance must be greater than zero and no more than 20,000 miles.")
+    cycle_used = float(data.get("cycle_used", data.get("current_cycle_used")))
+    if not math.isfinite(cycle_used) or not 0 <= cycle_used <= 70:
+        raise ValueError("Cycle used must be from 0 through 70 hours.")
     time_zone_name = data.get("time_zone", "UTC")
     try:
-        log_zone = ZoneInfo(time_zone_name)
+        regional_zone = ZoneInfo(time_zone_name)
     except (ZoneInfoNotFoundError, TypeError) as exc:
         raise ValueError("Choose a valid home-terminal time zone.") from exc
-    departure = datetime.fromisoformat(data["departure"].replace("Z", "+00:00"))
+    try:
+        departure_value = data["departure"]
+        if not isinstance(departure_value, str):
+            raise ValueError
+        departure = datetime.fromisoformat(departure_value.replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Choose a valid departure date and time.") from exc
+    standard_reference = datetime(departure.year, 1, 15, 12, tzinfo=regional_zone)
+    standard_offset = standard_reference.utcoffset()
+    if standard_offset is None:
+        raise ValueError("Choose a valid home-terminal time zone.")
+    log_zone = timezone(standard_offset)
     start = departure.replace(tzinfo=log_zone) if departure.tzinfo is None else departure.astimezone(log_zone)
     # Driver estimate: a conservative 55 mph average, independent of car-routing ETA.
     drive_remaining = miles / 55 * 60
@@ -118,6 +202,7 @@ def _make_plan(data):
         events.append({"type": kind, "label": label, "start": start_at.astimezone(log_zone).isoformat(),
                       "end": now.astimezone(log_zone).isoformat(), "minutes": round(minutes),
                       "distance_miles": round(distance, 1), "distance_exact_miles": distance,
+                      "start_miles": round(distance_driven, 1),
                       "cumulative_miles": round(distance_driven + distance, 1)})
         return start_at, now
 
@@ -125,8 +210,8 @@ def _make_plan(data):
     driven_today = 0
     driving_since_break = 0
     miles_since_fuel = 0
-    while drive_remaining > 0.01:
-        if not pickup_done and distance_driven >= pickup_miles - 0.01:
+    while drive_remaining > 0.000001:
+        if not pickup_done and distance_driven >= pickup_miles - 0.000001:
             if cycle_remaining < 60:
                 event("offduty", "34-hour cycle restart", 34 * 60)
                 shift_elapsed = driven_today = driving_since_break = 0
@@ -143,7 +228,7 @@ def _make_plan(data):
         if not pickup_done:
             drive_limit = min(drive_limit, (pickup_miles - distance_driven) / 55 * 60)
         fuel_limit = (1000 - miles_since_fuel) / 55 * 60
-        if fuel_limit <= 0.01:
+        if fuel_limit <= 0.000001:
             duration = 30
             event("onduty", "Fuel stop", duration)
             shift_elapsed += duration
@@ -153,17 +238,21 @@ def _make_plan(data):
             continue
         drive_limit = min(drive_limit, fuel_limit)
 
-        # Cycle can only be restored by taking a 34-hour restart. We place one
-        # when remaining cycle time is insufficient to advance to the next rest.
-        if cycle_remaining < 30 and drive_limit < 30:
-            event("offduty", "34-hour cycle restart", 34 * 60)
-            shift_elapsed = driven_today = driving_since_break = 0
-            cycle_remaining = 70 * 60
-            continue
-
-        if drive_limit <= 0.01:
-            event("offduty", "10-hour daily rest", 10 * 60)
-            shift_elapsed = driven_today = driving_since_break = 0
+        if drive_limit <= 0.000001:
+            if cycle_remaining <= 0.000001:
+                event("offduty", "34-hour cycle restart", 34 * 60)
+                shift_elapsed = driven_today = driving_since_break = 0
+                cycle_remaining = 70 * 60
+            elif driven_today >= 11 * 60 - 0.01 or shift_elapsed >= 14 * 60 - 0.01:
+                event("offduty", "10-hour daily rest", 10 * 60)
+                shift_elapsed = driven_today = driving_since_break = 0
+            elif driving_since_break >= 8 * 60 - 0.01:
+                event("onduty", "30-minute break", 30)
+                shift_elapsed += 30
+                cycle_remaining -= 30
+                driving_since_break = 0
+            else:
+                raise ValueError("The schedule reached an unexpected driving limit.")
             continue
 
         segment_miles = min(distance_remaining, drive_limit / 60 * 55)
@@ -179,21 +268,22 @@ def _make_plan(data):
         miles_since_fuel += segment_miles
 
         # Take the required 30 minutes before driving exceeds 8 cumulative hours.
-        if driving_since_break >= 8 * 60 - 0.01 and drive_remaining > 0.01:
+        break_due = driving_since_break >= 8 * 60 - 0.01 and drive_remaining > 0.000001
+        fuel_due = miles_since_fuel >= 1000 - 0.01 and drive_remaining > 0.000001
+        if fuel_due:
+            event("onduty", "Fuel stop · 30-minute break" if break_due else "Fuel stop", 30)
+            shift_elapsed += 30
+            cycle_remaining -= 30
+            miles_since_fuel = 0
+            driving_since_break = 0
+        elif break_due:
             event("onduty", "30-minute break", 30)
             shift_elapsed += 30
             cycle_remaining -= 30
             driving_since_break = 0
 
-        if miles_since_fuel >= 1000 - 0.01 and drive_remaining > 0.01:
-            event("onduty", "Fuel stop", 30)
-            shift_elapsed += 30
-            cycle_remaining -= 30
-            miles_since_fuel = 0
-            driving_since_break = 0
-
         # A drive segment may use the exact remaining window/cycle; rest before next segment.
-        if drive_remaining > 0.01 and (driven_today >= 11 * 60 - 0.01 or shift_elapsed >= 14 * 60 - 0.01):
+        if drive_remaining > 0.000001 and (driven_today >= 11 * 60 - 0.01 or shift_elapsed >= 14 * 60 - 0.01):
             event("offduty", "10-hour daily rest", 10 * 60)
             shift_elapsed = driven_today = driving_since_break = 0
 
@@ -205,8 +295,12 @@ def _make_plan(data):
     cycle_remaining -= 60
     arrival = now.astimezone(log_zone)
     days = _calendar_logs(start, arrival, events)
+    offset_minutes = int(standard_offset.total_seconds() // 60)
+    sign = "+" if offset_minutes >= 0 else "-"
+    offset_minutes = abs(offset_minutes)
+    standard_time_label = f"UTC{sign}{offset_minutes // 60:02d}:{offset_minutes % 60:02d}"
     return {"distance_miles": round(miles, 1), "estimated_drive_hours": round(miles / 55, 1),
-            "arrival": arrival.isoformat(), "time_zone": time_zone_name, "events": events, "days": days,
+            "arrival": arrival.isoformat(), "time_zone": time_zone_name, "standard_time_label": standard_time_label, "events": events, "days": days,
             "cycle_hours_remaining": round(max(cycle_remaining, 0) / 60, 1),
             "assumptions": ["Truck travel estimate: 55 mph average", "1 hour pickup and 1 hour drop-off",
                             "30-minute fuel stop at least every 1,000 miles", "10-hour daily rest; 34-hour cycle restart when needed"]}
@@ -249,7 +343,7 @@ def _calendar_logs(start, end, events):
             key = item["type"]
             if key == "driving":
                 miles_driven += item["distance_exact_miles"] * (b - a).total_seconds() / max(1, (datetime.fromisoformat(item["end"]) - datetime.fromisoformat(item["start"])).total_seconds())
-            remarks.append({"start": a.isoformat(), "label": item["label"], "cumulative_miles": item["cumulative_miles"]})
+            remarks.append({"start": a.isoformat(), "label": item["label"], "cumulative_miles": round(mileage_at(a), 1)})
             if a > cursor:
                 segments.append({"status": "offduty", "start_minute": int((cursor - midnight).total_seconds() / 60),
                                  "end_minute": int((a - midnight).total_seconds() / 60)})
@@ -282,9 +376,11 @@ def _calendar_logs(start, end, events):
 def plan(request):
     try:
         data = request.data
+        _validate_trip_inputs(data)
         route = _route_trip(data)
-        result = _make_plan({**data, "distance_miles": route["distance_miles"], "pickup_miles": route["pickup_miles"]})
+        result = _make_plan({**data, "cycle_used": data.get("cycle_used", data.get("current_cycle_used")),
+                             "distance_miles": route["distance_miles"], "pickup_miles": route["pickup_miles"]})
         result.update({"route": route})
         return Response(result)
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+    except (ValueError, TypeError, KeyError, OverflowError, json.JSONDecodeError) as exc:
         return Response({"error": str(exc) or "Invalid trip details."}, status=400)

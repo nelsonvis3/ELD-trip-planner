@@ -2,9 +2,9 @@
 
 The form requires all three links. Fill these in after the corresponding artifact exists:
 
-- GitHub code: `PENDING — choose a repository and publish this checkout`
+- GitHub code: `PENDING — publish the local Git checkout to GitHub (no remote is configured)`
 - Loom walkthrough (3–5 minutes): `PENDING — record and share the video`
-- Hosted app: `PENDING — deploy the Render blueprint and smoke-check the public route flow`
+- Hosted app: PENDING — deploy the backend root on Vercel and smoke-check the public route flow
 
 ## Suggested Loom run-through (about 4 minutes)
 
