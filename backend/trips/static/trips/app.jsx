@@ -1,3 +1,107 @@
+function haversineMiles([lon1, lat1], [lon2, lat2]) {
+  const R = 3958.8, rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// MapLibre usa [lon, lat], igual que tu API: no hace falta invertir nada
+function makePointFinder(coords, routeMiles) {
+  const cum = [0];
+  for (let i = 1; i < coords.length; i++) {
+    cum.push(cum[i - 1] + haversineMiles(coords[i - 1], coords[i]));
+  }
+  const scale = cum[cum.length - 1] / routeMiles;
+  return (miles) => {
+    const target = Math.min(Math.max(miles * scale, 0), cum[cum.length - 1]);
+    let i = 1;
+    while (i < cum.length - 1 && cum[i] < target) i++;
+    const t = (target - cum[i - 1]) / (cum[i] - cum[i - 1] || 1);
+    return [
+      coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * t,
+      coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * t,
+    ];
+  };
+}
+
+function popupContent(title, detail) {
+  const div = document.createElement("div");
+  const b = document.createElement("strong");
+  b.textContent = title;
+  div.append(b, document.createElement("br"), document.createTextNode(detail));
+  return div;
+}
+
+function drawTrip(map, data) {
+  const run = () => {
+    const coords = data.route.geometry.coordinates;
+
+    // Limpiar marcadores del viaje anterior
+    (map._tripMarkers || []).forEach((m) => m.remove());
+    map._tripMarkers = [];
+
+    // Línea de la ruta
+    const feature = { type: "Feature", geometry: data.route.geometry };
+    if (map.getSource("route")) {
+      map.getSource("route").setData(feature);
+    } else {
+      map.addSource("route", { type: "geojson", data: feature });
+      map.addLayer({
+        id: "route-casing", type: "line", source: "route",
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: { "line-color": "#ffffff", "line-width": 9 },
+      });
+      map.addLayer({
+        id: "route-line", type: "line", source: "route",
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: { "line-color": "#2563eb", "line-width": 5 },
+      });
+    }
+
+    // Actual, pickup y dropoff
+    const names = ["Ubicación actual", "Pickup", "Drop-off"];
+    const colors = ["#16a34a", "#f59e0b", "#dc2626"];
+    data.route.places.forEach((p, i) => {
+      const marker = new maplibregl.Marker({ color: colors[i] })
+        .setLngLat([p.lon, p.lat])
+        .setPopup(new maplibregl.Popup().setDOMContent(popupContent(names[i], p.name)))
+        .addTo(map);
+      map._tripMarkers.push(marker);
+    });
+
+    // Paradas (combustible, pausas, descansos) sobre la ruta
+    const pointAt = makePointFinder(coords, data.distance_miles);
+    data.events
+      .filter((e) => e.type !== "driving" && !/Pickup|Drop-off/.test(e.label))
+      .forEach((e) => {
+        const el = document.createElement("div");
+        el.style.cssText =
+          "width:14px;height:14px;border-radius:50%;border:2px solid #fff;" +
+          "box-shadow:0 0 0 1px rgba(0,0,0,.3);background:" +
+          (e.type === "offduty" ? "#6b7280" : "#f59e0b");
+        const when = new Date(e.start).toLocaleString();
+        const marker = new maplibregl.Marker({ element: el })
+          .setLngLat(pointAt(e.cumulative_miles))
+          .setPopup(new maplibregl.Popup().setDOMContent(
+            popupContent(e.label, `Milla ${e.cumulative_miles} · ${when} · ${e.minutes} min`)
+          ))
+          .addTo(map);
+        map._tripMarkers.push(marker);
+      });
+
+    // Encuadrar toda la ruta
+    const bounds = coords.reduce(
+      (b, c) => b.extend(c),
+      new maplibregl.LngLatBounds(coords[0], coords[0])
+    );
+    map.fitBounds(bounds, { padding: 60 });
+  };
+
+  // Si el estilo todavía no cargó, esperar
+  if (map.isStyleLoaded()) run();
+  else map.once("idle", run);
+}
 const {useEffect,useRef,useState}=React;
 const STATUS_Y={offduty:18,sleeper:43,driving:68,onduty:93};
 const ZONES=['America/New_York','America/Chicago','America/Denver','America/Phoenix','America/Los_Angeles','America/Anchorage','Pacific/Honolulu'];
@@ -13,20 +117,37 @@ function App(){
  const mapRef=useRef(null),map=useRef(null),routeLayer=useRef(null),markerLayer=useRef(null);
  const initialZone=ZONES.includes(browserZone)?browserZone:'America/Chicago';
  const[form,setForm]=useState({current_location:'',pickup_location:'',dropoff_location:'',cycle_used:'0',time_zone:initialZone,departure:localInputValue(new Date(),initialZone)});
- const[loading,setLoading]=useState(false),[error,setError]=useState(''),[plan,setPlan]=useState(null);
- useEffect(()=>{if(!map.current&&mapRef.current){map.current=L.map(mapRef.current,{zoomControl:false}).setView([39.5,-98.35],4);L.control.zoom({position:'bottomright'}).addTo(map.current);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}).addTo(map.current);routeLayer.current=L.layerGroup().addTo(map.current);markerLayer.current=L.layerGroup().addTo(map.current)}},[]);
+ const[loading,setLoading]=useState(false),[error,setError]=useState(''),[plan,setPlan]=useState(null),[mapError,setMapError]=useState(false);
+ useEffect(()=>{if(!map.current&&mapRef.current){map.current=new maplibregl.Map({container:mapRef.current,style:'https://tiles.openfreemap.org/styles/positron',center:[-98.35,39.5],zoom:4,attributionControl:true});map.current.addControl(new maplibregl.NavigationControl({showCompass:false}),'bottom-right');map.current.on('error',()=>setMapError(true));markerLayer.current=[];routeLayer.current=()=>{if(map.current.getLayer('trip-route'))map.current.removeLayer('trip-route');if(map.current.getSource('trip-route'))map.current.removeSource('trip-route');markerLayer.current?.forEach(marker=>marker.remove());markerLayer.current=[]}}},[]);
  function change(e){const{name,value}=e.target;setForm({...form,[name]:value})}
- async function submit(e){e.preventDefault();setError('');setPlan(null);routeLayer.current?.clearLayers();markerLayer.current?.clearLayers();setLoading(true);try{if(!form.current_location.trim()||!form.pickup_location.trim()||!form.dropoff_location.trim())throw new Error('Enter a current location, pickup and drop-off.');const cycle=Number(form.cycle_used);if(!Number.isFinite(cycle)||cycle<0||cycle>70)throw new Error('Cycle used must be from 0 through 70 hours.');if(!form.cycle_used.trim())throw new Error('Enter the current cycle hours used.');if(!form.departure)throw new Error('Choose a valid departure time.');
-   const response=await fetch('/api/plan/',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':document.cookie.match(/csrftoken=([^;]+)/)?.[1]||''},body:JSON.stringify({...form,cycle_used:cycle})});let result;try{result=await response.json()}catch{throw new Error('Planner returned an unreadable response. Please try again.')}if(!response.ok)throw new Error(result.error||'Could not calculate this trip.');if(!result.route?.geometry?.coordinates?.length||!result.days?.length)throw new Error('The planner returned an incomplete result. Please try again.');
-   const route=result.route,line=route.geometry.coordinates,latlngs=line.map(p=>[p[1],p[0]]);routeLayer.current.clearLayers();markerLayer.current.clearLayers();L.polyline(latlngs,{color:'#1769aa',weight:5,opacity:.9}).addTo(routeLayer.current);const palette=['#1769aa','#16834b','#d33f49'];const labels=['Current location','Pickup','Drop-off'];route.places.forEach((p,i)=>{const marker=L.circleMarker([p.lat,p.lon],{radius:8,color:'#fff',weight:3,fillColor:palette[i],fillOpacity:1});const popup=document.createElement('div');const title=document.createElement('strong');title.textContent=labels[i];const text=document.createElement('div');text.textContent=p.name;popup.append(title,text);marker.bindPopup(popup).addTo(markerLayer.current)});
-   const restIcon=L.divIcon({className:'stop-icon rest',html:'R',iconSize:[24,24],iconAnchor:[12,12]}),fuelIcon=L.divIcon({className:'stop-icon fuel',html:'F',iconSize:[24,24],iconAnchor:[12,12]});result.events.filter(ev=>ev.type==='offduty'||ev.label.startsWith('Fuel stop')||ev.label==='30-minute break').forEach(ev=>{const at=pointOnRoute(line,ev.start_miles??ev.cumulative_miles,route.distance_miles),marker=L.marker(at,{icon:ev.type==='offduty'||ev.label==='30-minute break'?restIcon:fuelIcon});const popup=document.createElement('div'),title=document.createElement('strong');title.textContent=ev.label;const text=document.createElement('div');text.textContent=`${fmtTime(ev.start)} · ${duration(ev.minutes)} · ${Math.round(ev.start_miles??ev.cumulative_miles)} route mi`;popup.append(title,text);marker.bindPopup(popup).addTo(markerLayer.current)});map.current.fitBounds(L.latLngBounds(latlngs).pad(.13));setPlan(result);setTimeout(()=>map.current.invalidateSize(),60);
-  }catch(err){setError(err.message||'Something went wrong while planning this trip.')}finally{setLoading(false)}}
+ async function submit(e){
+  e.preventDefault();setError('');setPlan(null);routeLayer.current?.();setLoading(true);
+  try{
+   if(!form.current_location.trim()||!form.pickup_location.trim()||!form.dropoff_location.trim())throw new Error('Enter a current location, pickup and drop-off.');
+   const cycle=Number(form.cycle_used);
+   if(!Number.isFinite(cycle)||cycle<0||cycle>70)throw new Error('Cycle used must be from 0 through 70 hours.');
+   if(!form.cycle_used.trim())throw new Error('Enter the current cycle hours used.');
+   if(!form.departure)throw new Error('Choose a valid departure time.');
+   const response=await fetch('/api/plan/',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':document.cookie.match(/csrftoken=([^;]+)/)?.[1]||''},body:JSON.stringify({...form,cycle_used:cycle})});
+   const responseText=await response.text();let result;
+   try{result=JSON.parse(responseText)}catch{const detail=responseText.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().slice(0,180);throw new Error(`Planner returned HTTP ${response.status}${detail?`: ${detail}`:'. Please try again.'}`)}
+   if(!response.ok)throw new Error(result.error||`Planner returned HTTP ${response.status}.`);
+   if(!result.route?.geometry?.coordinates?.length||!result.days?.length)throw new Error('Planner returned an incomplete result. Please try again.');
+   setPlan(result);
+   try{
+    const route=result.route,line=route.geometry.coordinates;
+    const draw=()=>{try{if(!map.current?.isStyleLoaded())return;routeLayer.current?.();map.current.addSource('trip-route',{type:'geojson',data:route.geometry});map.current.addLayer({id:'trip-route',type:'line',source:'trip-route',layout:{'line-join':'round','line-cap':'round'},paint:{'line-color':'#1769aa','line-width':5,'line-opacity':.9}});const palette=['#1769aa','#16834b','#d33f49'],labels=['Current location','Pickup','Drop-off'];route.places.forEach((p,i)=>{const element=document.createElement('div');element.className='map-point';element.style.background=palette[i];const popup=document.createElement('div'),title=document.createElement('strong'),text=document.createElement('div');title.textContent=labels[i];text.textContent=p.name;popup.append(title,text);markerLayer.current.push(new maplibregl.Marker({element,anchor:'center'}).setLngLat([p.lon,p.lat]).setPopup(new maplibregl.Popup({offset:14}).setDOMContent(popup)).addTo(map.current))});result.events.filter(ev=>ev.type==='offduty'||ev.label.startsWith('Fuel stop')||ev.label==='30-minute break').forEach(ev=>{const at=pointOnRoute(line,ev.start_miles??ev.cumulative_miles,route.distance_miles),element=document.createElement('div'),isRest=ev.type==='offduty'||ev.label==='30-minute break';element.className=`stop-icon ${isRest?'rest':'fuel'}`;element.textContent=isRest?'R':'F';const popup=document.createElement('div'),title=document.createElement('strong'),text=document.createElement('div');title.textContent=ev.label;text.textContent=`${fmtTime(ev.start)} · ${duration(ev.minutes)} · ${Math.round(ev.start_miles??ev.cumulative_miles)} route mi`;popup.append(title,text);markerLayer.current.push(new maplibregl.Marker({element,anchor:'center'}).setLngLat([at[1],at[0]]).setPopup(new maplibregl.Popup({offset:14}).setDOMContent(popup)).addTo(map.current))});const bounds=line.reduce((b,p)=>b.extend(p),new maplibregl.LngLatBounds(line[0],line[0]));map.current.fitBounds(bounds,{padding:48})}catch{setMapError(true)}};
+    if(!map.current)throw new Error('Map initialization failed.');
+    if(map.current.isStyleLoaded())draw();else map.current.once('load',draw);
+   }catch{setMapError(true)}
+  }catch(err){setError(err.message||'Something went wrong while planning this trip.')}finally{setLoading(false)}
+ }
  const route=plan?.route;
  return <div className="shell"><header className="topbar no-print"><a className="brand" href="#top"><span className="brand-icon">RL</span><span>Roadledger</span></a><div className="top-meta"><span className="live-dot"/>TRIP OPERATIONS <i/> PROPERTY CARRIER · 70 / 8</div><button className="print-button" disabled={!plan} onClick={()=>window.print()}>Print daily logs <b>⌘ P</b></button></header>
   <main id="top"><section className="hero"><div><div className="kicker">HOURS OF SERVICE · TRIP PLANNER</div><h1>Plan the miles.<br/><span>Know the hours.</span></h1><p>A route and daily duty record shaped around your available hours.</p></div><div className="hero-note"><span>01—04</span><p>ROUTE<br/>STOPS<br/>DUTY LOGS</p></div></section>
-  <div className="workspace"><aside className="inputs no-print"><div className="section-cap"><span>TRIP INPUT</span><span>01 / 03</span></div><form onSubmit={submit}><AddressField label="Current location" color="blue" name="current_location" value={form.current_location} onChange={change} placeholder="City, state or address"/><AddressField label="Pickup location" color="green" name="pickup_location" value={form.pickup_location} onChange={change} placeholder="City, state or address"/><AddressField label="Drop-off location" color="red" name="dropoff_location" value={form.dropoff_location} onChange={change} placeholder="City, state or address"/><div className="input-pair"><label>Cycle used <small>HOURS</small><input name="cycle_used" type="number" required min="0" max="70" step="0.1" value={form.cycle_used} onChange={change}/></label><label>Depart at · standard time<input name="departure" type="datetime-local" required value={form.departure} onChange={change}/></label></div><p className="service-note">Locations are geocoded in sequence through OpenStreetMap.</p>{error&&<div className="error" role="alert">{error}</div>}<button className="plan-button" disabled={loading}>{loading?<><span className="spinner"/>Building route & logs…</>:<>Generate trip plan <span>↗</span></>}</button></form><div className="rule-card"><b>Planning assumptions</b><p>Property carrier · 70 hours / 8 days · no adverse conditions · 55 mph estimated truck pace.</p><label className="zone-label">Log time zone · home terminal<select name="time_zone" value={form.time_zone} onChange={change}>{ZONES.map(zone=><option value={zone} key={zone}>{zone.replaceAll('_',' ')} · {new Intl.DateTimeFormat('en-US',{timeZone:zone,timeZoneName:'short'}).format(new Date(Date.UTC(new Date().getFullYear(),0,15,12))).split(' ').pop()}</option>)}</select></label><small className="zone-hint">Departure and every sheet use the terminal’s standard-time offset (no daylight shift).</small></div></aside>
+  <div className="workspace"><aside className="inputs no-print"><div className="section-cap"><span>TRIP INPUT</span><span>01 / 03</span></div><form onSubmit={submit}><AddressField label="Current location" color="blue" name="current_location" value={form.current_location} onChange={change} placeholder="City, state or address"/><AddressField label="Pickup location" color="green" name="pickup_location" value={form.pickup_location} onChange={change} placeholder="City, state or address"/><AddressField label="Drop-off location" color="red" name="dropoff_location" value={form.dropoff_location} onChange={change} placeholder="City, state or address"/><div className="input-pair"><label>Cycle used <small>HOURS</small><input name="cycle_used" type="number" required min="0" max="70" step="0.1" value={form.cycle_used} onChange={change}/></label><label>Depart at · standard time<input name="departure" type="datetime-local" required value={form.departure} onChange={change}/></label></div><p className="service-note">Locations are geocoded with Photon using OpenStreetMap data.</p>{error&&<div className="error" role="alert">{error}</div>}<button className="plan-button" disabled={loading}>{loading?<><span className="spinner"/>Building route & logs…</>:<>Generate trip plan <span>↗</span></>}</button></form><div className="rule-card"><b>Planning assumptions</b><p>Property carrier · 70 hours / 8 days · no adverse conditions · 55 mph estimated truck pace.</p><label className="zone-label">Log time zone · home terminal<select name="time_zone" value={form.time_zone} onChange={change}>{ZONES.map(zone=><option value={zone} key={zone}>{zone.replaceAll('_',' ')} · {new Intl.DateTimeFormat('en-US',{timeZone:zone,timeZoneName:'short'}).format(new Date(Date.UTC(new Date().getFullYear(),0,15,12))).split(' ').pop()}</option>)}</select></label><small className="zone-hint">Departure and every sheet use the terminal’s standard-time offset (no daylight shift).</small></div></aside>
    <div className="content">{loading&&<div className="loading-banner">Looking up the three locations, routing the trip and drawing the daily logs…</div>}
-    <section className="map-card"><div className="map-heading"><div><div className="section-cap"><span>ROUTE MAP</span><span>02 / 03</span></div><h2>{route?`${Math.round(route.distance_miles).toLocaleString()} mi`:'The road ahead'}</h2></div><span className="map-stamp">OSM · OSRM</span></div><div id="map" ref={mapRef}/><div className="map-legend"><Legend color="blue" label="Current"/><Legend color="green" label="Pickup"/><Legend color="red" label="Drop-off"/><Legend color="purple" label="Rest"/><Legend color="amber" label="Fuel"/></div></section>
+    <section className="map-card"><div className="map-heading"><div><div className="section-cap"><span>ROUTE MAP</span><span>02 / 03</span></div><h2>{route?`${Math.round(route.distance_miles).toLocaleString()} mi`:'The road ahead'}</h2></div><span className="map-stamp">OPENFREEMAP · OSRM</span></div><div id="map" ref={mapRef}/>{mapError&&<p className="map-error" role="status">Map service unavailable. Your route and stops remain available; check your connection and reload.</p>}<div className="map-legend"><Legend color="blue" label="Current"/><Legend color="green" label="Pickup"/><Legend color="red" label="Drop-off"/><Legend color="purple" label="Rest"/><Legend color="amber" label="Fuel"/></div></section>
     {!plan?<section className="empty-state"><div className="empty-symbol">24</div><div><b>Your daily logs start here.</b><span>Add the three locations and available cycle hours to build a planned route.</span></div></section>:<><section className="summary"><div className="summary-heading"><div className="section-cap"><span>TRIP SUMMARY</span><span>03 / 03</span></div><span className="arrival">ARRIVE&nbsp; {fmtDate(plan.arrival)} · {fmtTime(plan.arrival)} · {plan.standard_time_label}</span></div><div className="summary-grid"><SummaryItem label="ROUTE MILES" value={Math.round(route.distance_miles).toLocaleString()} suffix="mi"/><SummaryItem label="EST. DRIVING" value={plan.estimated_drive_hours} suffix="hrs"/><SummaryItem label="DAILY LOGS" value={plan.days.length} suffix="sheets"/><SummaryItem label="CYCLE LEFT" value={plan.cycle_hours_remaining} suffix="hrs"/></div></section>
      <section className="stops-section"><div className="section-cap"><span>STOPS & DEPARTURE</span><span>{plan.events.length} ENTRIES</span></div><div className="event-list">{plan.events.map((ev,i)=><div className="event" key={i}><time>{fmtTime(ev.start)}</time><span className={'event-mark '+(ev.type==='driving'?'drive':ev.type==='offduty'?'rest':'work')}/><div><b>{ev.label}</b><small>{ev.type==='driving'?`${ev.distance_miles} miles · `:''}{duration(ev.minutes)}</small></div><span className="event-date">{fmtShortDate(ev.start)}</span></div>)}</div></section>
      <section className="logs-section"><div className="section-cap"><span>DRIVER’S DAILY LOGS</span><span>{plan.days.length} CALENDAR {plan.days.length===1?'DAY':'DAYS'}</span></div>{plan.days.map(day=><DailyLog key={day.date} day={day} route={route}/>)}</section>

@@ -18,13 +18,17 @@ _geocode_cache = {}
 _last_geocode_at = 0.0
 
 
-def _get_json(url, *, user_agent="RoadLedger/0.1 (ELD trip planning demonstration)"):
+def _get_json(url, *, service="free map", user_agent="RoadLedger/1.0 (ELD trip planning demonstration)"):
     request = Request(url, headers={"User-Agent": user_agent, "Accept": "application/json", "Accept-Language": "en"})
     try:
         with urlopen(request, timeout=12) as response:
             return json.loads(response.read())
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ValueError("The free map service is temporarily unavailable. Please try again shortly.") from exc
+    except HTTPError as exc:
+        if exc.code == 403:
+            raise ValueError(f"The {service} provider rejected this request (HTTP 403). Please try again shortly.") from exc
+        raise ValueError(f"The {service} provider returned HTTP {exc.code}. Please try again shortly.") from exc
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"The {service} provider is temporarily unavailable. Please try again shortly.") from exc
 
 
 def _geocode(query):
@@ -40,14 +44,18 @@ def _geocode(query):
         if wait > 0:
             time.sleep(wait)
         _last_geocode_at = time.monotonic()
-        results = _get_json("https://nominatim.openstreetmap.org/search?" + urlencode({"format": "jsonv2", "limit": 1, "q": query}))
-        if not results:
+        results = _get_json("https://photon.komoot.io/api/?" + urlencode({"limit": 1, "lang": "en", "q": query}), service="geocoding")
+        features = results.get("features") if isinstance(results, dict) else None
+        if not features:
             raise ValueError(f'Could not find "{query}". Try adding a city and state.')
         try:
-            name = results[0]["display_name"]
-            if not isinstance(name, str) or not name.strip():
+            feature = features[0]
+            properties = feature["properties"]
+            coordinates = feature["geometry"]["coordinates"]
+            name = ", ".join(str(properties[key]).strip() for key in ("name", "street", "city", "state", "country") if properties.get(key))
+            if not name.strip() or len(coordinates) < 2:
                 raise ValueError
-            place = {"lat": float(results[0]["lat"]), "lon": float(results[0]["lon"]), "name": name.strip()}
+            place = {"lat": float(coordinates[1]), "lon": float(coordinates[0]), "name": name.strip()}
         except (KeyError, TypeError, ValueError, IndexError) as exc:
             raise ValueError("The geocoding service returned an invalid location. Please try a more specific address.") from exc
         if not math.isfinite(place["lat"]) or not math.isfinite(place["lon"]) or not -90 <= place["lat"] <= 90 or not -180 <= place["lon"] <= 180:
@@ -85,8 +93,20 @@ def _route_trip(data):
             raise ValueError("Enter all three locations using no more than 180 characters each.")
     places = [_geocode(data[field]) for field in location_fields]
     coordinates = ";".join(f'{p["lon"]},{p["lat"]}' for p in places)
-    url = f"https://router.project-osrm.org/route/v1/driving/{coordinates}?overview=full&geometries=geojson&steps=true"
-    result = _get_json(url)
+    query = f"{coordinates}?overview=full&geometries=geojson&steps=true"
+    routing_urls = (
+        f"https://routing.openstreetmap.de/routed-car/route/v1/driving/{query}",
+        f"https://router.project-osrm.org/route/v1/driving/{query}",
+    )
+    routing_error = None
+    for url in routing_urls:
+        try:
+            result = _get_json(url, service="routing")
+            break
+        except ValueError as exc:
+            routing_error = exc
+    else:
+        raise routing_error or ValueError("The routing providers are temporarily unavailable. Please try again shortly.")
     if not isinstance(result, dict) or result.get("code") != "Ok" or not result.get("routes"):
         raise ValueError("No drivable route was found between these locations.")
     try:
