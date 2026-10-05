@@ -1,9 +1,0 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "django",
-  "functions": {
-    "config/wsgi.py": {
-      "maxDuration": 60
-    }
-  }
-}

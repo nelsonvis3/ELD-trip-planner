@@ -7,3 +7,5 @@ staticfiles/
 .DS_Store
 
 node_modules/
+
+LOOM_AND_CODE_GUIDE.md
