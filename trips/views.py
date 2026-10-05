@@ -203,7 +203,7 @@ def _make_plan(data):
         raise ValueError("Choose a valid home-terminal time zone.")
     log_zone = timezone(standard_offset)
     start = departure.replace(tzinfo=log_zone) if departure.tzinfo is None else departure.astimezone(log_zone)
-    # Driver estimate: a conservative 55 mph average, independent of car-routing ETA.
+
     drive_remaining = miles / 55 * 60
     distance_remaining = miles
     now = start.astimezone(timezone.utc)
@@ -242,7 +242,7 @@ def _make_plan(data):
             driving_since_break = 0
             pickup_done = True
             continue
-        # The 14-hour window includes all elapsed on-duty time, including breaks.
+
         drive_limit = min(11 * 60 - driven_today, 14 * 60 - shift_elapsed,
                           8 * 60 - driving_since_break, drive_remaining, cycle_remaining)
         if not pickup_done:
@@ -287,7 +287,6 @@ def _make_plan(data):
         cycle_remaining -= segment_minutes
         miles_since_fuel += segment_miles
 
-        # Take the required 30 minutes before driving exceeds 8 cumulative hours.
         break_due = driving_since_break >= 8 * 60 - 0.01 and drive_remaining > 0.000001
         fuel_due = miles_since_fuel >= 1000 - 0.01 and drive_remaining > 0.000001
         if fuel_due:

@@ -6,7 +6,6 @@ function haversineMiles([lon1, lat1], [lon2, lat2]) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// MapLibre usa [lon, lat], igual que tu API: no hace falta invertir nada
 function makePointFinder(coords, routeMiles) {
   const cum = [0];
   for (let i = 1; i < coords.length; i++) {
@@ -37,11 +36,9 @@ function drawTrip(map, data) {
   const run = () => {
     const coords = data.route.geometry.coordinates;
 
-    // Limpiar marcadores del viaje anterior
     (map._tripMarkers || []).forEach((m) => m.remove());
     map._tripMarkers = [];
 
-    // Línea de la ruta
     const feature = { type: "Feature", geometry: data.route.geometry };
     if (map.getSource("route")) {
       map.getSource("route").setData(feature);
@@ -59,7 +56,6 @@ function drawTrip(map, data) {
       });
     }
 
-    // Actual, pickup y dropoff
     const names = ["Ubicación actual", "Pickup", "Drop-off"];
     const colors = ["#16a34a", "#f59e0b", "#dc2626"];
     data.route.places.forEach((p, i) => {
@@ -70,7 +66,6 @@ function drawTrip(map, data) {
       map._tripMarkers.push(marker);
     });
 
-    // Paradas (combustible, pausas, descansos) sobre la ruta
     const pointAt = makePointFinder(coords, data.distance_miles);
     data.events
       .filter((e) => e.type !== "driving" && !/Pickup|Drop-off/.test(e.label))
@@ -90,7 +85,6 @@ function drawTrip(map, data) {
         map._tripMarkers.push(marker);
       });
 
-    // Encuadrar toda la ruta
     const bounds = coords.reduce(
       (b, c) => b.extend(c),
       new maplibregl.LngLatBounds(coords[0], coords[0])
@@ -98,7 +92,6 @@ function drawTrip(map, data) {
     map.fitBounds(bounds, { padding: 60 });
   };
 
-  // Si el estilo todavía no cargó, esperar
   if (map.isStyleLoaded()) run();
   else map.once("idle", run);
 }
